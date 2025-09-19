@@ -1,0 +1,75 @@
+# Docker
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+resources:
+  repositories:
+    - repository: core-iac
+      type: git
+      name: 'Produto e Tecnologia/refuturiza-iac'
+
+variables:
+  tag: '$(Build.DefinitionName)'
+  ECR_IMG: ''
+  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+  ECR_REPOSITORY: 'refuturiza-etl-financeiro'
+  ECS_CLUSTER: 'Core-Production'
+  ECS_CONTAINER_NAME: 'etl-financeiro'
+  ECS_SERVICE: 'etl-financeiro'
+  ECS_TASK_DEFINITION: 'etl-financeiro-live-definition'
+  REGISTRY: 'https://pkgs.dev.azure.com/refuturiza/_packaging/refuturiza/nuget/v3/index.json'
+
+stages:
+- stage: Build
+  displayName: Build image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        arguments: '--build-arg ARTIFACTS_ENDPOINT=$(REGISTRY) --build-arg ACCESS_TOKEN=$(SYSTEM_ACCESSTOKEN) --build-arg USER=$(Build.RequestedForEmail) -t $(tag)'
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'AWS'
+        regionName: 'sa-east-1'
+        imageSource: 'imagename'
+        sourceImageName: '$(tag)'
+        sourceImageTag: 
+        repositoryName: '$(ECR_REPOSITORY)'
+        pushTag: 'PROD-$(Build.BuildId)'
+        outputVariable: 'ECR_IMG'
+    - bash: |
+       echo "##vso[task.setvariable variable=ecrimg;isOutput=true]$(ECR_IMG)"
+      name: setEcrImg
+- stage: Deploy
+  dependsOn: Build
+  displayName: Deploy
+  jobs:
+  - deployment: DeployWorker
+    displayName: Deploy Worker Service
+    variables:
+      - name: ECR_IMG
+        value: $[ stageDependencies.Build.Build.outputs['setEcrImg.ecrimg'] ]
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: ecs-deploy.yml@core-iac
+            parameters:
+              ECS_TASK_DEFINITION: ${ECS_TASK_DEFINITION}
+              ECR_IMG: ${ECR_IMG}
+              ECS_SERVICE: ${ECS_SERVICE}
+              ECS_CLUSTER: ${ECS_CLUSTER}
+              ECS_CONTAINER_NAME: ${ECS_CONTAINER_NAME}
