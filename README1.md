@@ -1,0 +1,113 @@
+# Enrich IPED Worker – Documentação Técnica
+
+## Visão Geral
+O repositório contém uma solução .NET 8 composta por três projetos:
+
+| Projeto | Tipo | Responsabilidade Principal |
+| --- | --- | --- |
+| `EnrichIpedWorker` | Worker Service | Hospeda os jobs Hangfire que consomem relatórios da IPED e orquestram a persistência em MySQL. |
+| `EnrichIpedClient` | Biblioteca | Cliente HTTP tipado (Refit) para a API IPED corporativa. |
+| `EnrichIped.DataInfrastructure` | Biblioteca | Repositórios, DTOs e scripts SQL responsáveis por validar o esquema e gravar os dados dos relatórios. |
+
+O Worker sobe um host genérico (`Host.CreateApplicationBuilder`) com Serilog, HttpClient, Hangfire e as dependências dos projetos auxiliares, garantindo a inicialização do esquema de banco e o agendamento dos jobs recorrentes assim que a aplicação inicia.【F:EnrichIpedWorker/Program.cs†L9-L49】【F:EnrichIpedWorker/Configurations/LogConfiguration.cs†L6-L30】
+
+## Arquitetura de Execução
+1. **Configuração & Logging** – Serilog é configurado com enriquecedores padrão e saída no console, incluindo enriquecimento com nome da máquina, thread e ambiente.【F:EnrichIpedWorker/Configurations/LogConfiguration.cs†L6-L27】
+2. **Resolução de Dependências** – O worker registra o cliente IPED (`AddIpedClient`), a infraestrutura de dados (`AddDataInfrastructure`) e a configuração do Hangfire server usando MySQL como storage.【F:EnrichIpedWorker/Program.cs†L37-L40】【F:EnrichIpedClient/DependencyInjection.cs†L12-L34】【F:EnrichIped.DataInfrastructure/DependencyInjection.cs†L11-L18】【F:EnrichIpedWorker/Configurations/HangfireConfiguration.cs†L17-L62】
+3. **Inicialização do Banco** – Antes de processar jobs, `IDatabaseInitializer` garante a existência das tabelas `IpedConfigurationReports`, `IpedDevelopmentReport`, `IpedLogReport` e `IpedCompleteReport`, executando os scripts SQL versãoados na pasta `Scripts`.【F:EnrichIpedWorker/Program.cs†L46-L48】【F:EnrichIped.DataInfrastructure/Repositories/Abstractions/Database/DatabaseInitializer.cs†L18-L81】【F:EnrichIped.DataInfrastructure/Utilities/LoadSqlScript.cs†L3-L17】
+4. **Agendamento de Jobs** – São criados três jobs recorrentes (log, development e complete) executados diariamente às 06:00, todos na fila `default`. Há ainda um hosted service de startup que enfileira uma primeira execução do relatório de desenvolvimento após 1 minuto do boot.【F:EnrichIpedWorker/Configurations/HangfireConfiguration.cs†L75-L88】【F:EnrichIpedWorker/Services/StartupJobService.cs†L19-L34】【F:EnrichIpedWorker/Constants/IpedConstants.cs†L19-L27】
+
+### Fluxo de um job de relatório
+1. **Seleção de Token** – Cada serviço obtém a lista de tokens configurados (`Token` e `TokenUdt`) e processa cada um sequencialmente, criando um escopo DI próprio para obter HttpClient, cliente IPED e repositórios.【F:EnrichIpedWorker/Services/CompleteReportService.cs†L141-L174】【F:EnrichIpedClient/Configurations/IpedSettings.cs†L3-L16】
+2. **Busca do relatório** – A classe base chama a API `/api/corporate/get-report` via Refit, aguardando até 60 minutos por um arquivo com status `completed`, com re-tentativas a cada 5 minutos caso o relatório não esteja pronto.【F:EnrichIpedWorker/Services/Base/BaseReportService.cs†L35-L95】【F:EnrichIpedWorker/Services/CompleteReportService.cs†L41-L85】【F:EnrichIpedClient/Abstractions/IIpedClient.cs†L7-L11】【F:EnrichIpedClient/Constants/IpedClientEndPoints.cs†L5-L12】【F:EnrichIpedWorker/Constants/IpedConstants.cs†L13-L27】
+3. **Controle de reprocessamento** – `IpedConfigurationRepository` grava metadados do arquivo (`LastFileExpiresAt`, `LastExecutionResult`, `LastCompletedSync`), evitando reprocessar relatórios com a mesma data de expiração e registrando o resultado da execução ou sincronização.【F:EnrichIpedWorker/Services/Base/BaseReportService.cs†L24-L55】【F:EnrichIped.DataInfrastructure/Repositories/IpedConfigurationRepository.cs†L33-L107】【F:EnrichIped.DataInfrastructure/Queries/ConfigurationReportsQuery.cs†L13-L54】
+4. **Download & Parsing** – O arquivo CSV é baixado com `HttpClient`, a codificação é detectada (UTF-8, Unicode, BigEndian, CP1252 ou ISO-8859-1) e os dados são lidos com CsvHelper respeitando os atributos declarados nas DTOs (delimitador `;`, cultura `pt-BR`).【F:EnrichIpedWorker/Services/Base/BaseReportService.cs†L73-L137】【F:EnrichIped.DataInfrastructure/Dtos/CompleteReport/CompleteReportDto.cs†L5-L50】【F:EnrichIped.DataInfrastructure/Dtos/DevelopmentReport/DevelopmentReportDto.cs†L5-L35】【F:EnrichIped.DataInfrastructure/Dtos/LogReport/LogReportDto.cs†L5-L30】
+5. **Persistência** – Cada serviço envia os registros para o respectivo repositório, que prioriza MySqlBulkCopy (`AllowLoadLocalInfile`) e, quando necessário, cai para inserção em lotes controlada por `BatchSettings` (com limite padrão de 1000 registros e até 5 lotes paralelos). Em todos os casos exige-se sucesso em pelo menos 80% das linhas para considerar a execução bem-sucedida.【F:EnrichIpedWorker/Services/CompleteReportService.cs†L64-L138】【F:EnrichIpedWorker/Services/DevelopmentReportService.cs†L100-L176】【F:EnrichIpedWorker/Services/LogReportService.cs†L64-L142】【F:EnrichIped.DataInfrastructure/Repositories/IpedCompleteRepository.cs†L33-L236】【F:EnrichIped.DataInfrastructure/Repositories/IpedDevelopmentRepository.cs†L45-L285】
+6. **Tratamento & Deduplicação** – Após gravar, cada repositório remove duplicidades específicas (por CPF/curso, CPF/data, etc.) e sanitiza strings/datas antes de inserir, evitando lixo nos campos e mantendo consistência histórica.【F:EnrichIped.DataInfrastructure/Repositories/IpedCompleteRepository.cs†L129-L236】【F:EnrichIped.DataInfrastructure/Repositories/IpedDevelopmentRepository.cs†L226-L285】【F:EnrichIped.DataInfrastructure/Repositories/IpedLogRepository.cs†L108-L166】【F:EnrichIped.DataInfrastructure/Extensions/StringExtensions.cs†L17-L62】【F:EnrichIped.DataInfrastructure/Queries/CompleteReportQuery.cs†L13-L36】【F:EnrichIped.DataInfrastructure/Queries/DevelopmentReportQuery.cs†L10-L48】【F:EnrichIped.DataInfrastructure/Queries/LogReportQuery.cs†L13-L23】
+
+### Serviços Disponíveis
+| Serviço | Tipo (`type`) | Dados armazenados | Repositório | Tabela | Observações |
+| --- | --- | --- | --- | --- | --- |
+| `ILogReportService` | `log` | Log de acessos/cursos com data, motivo e curso | `IIpedLogRepository` | `IpedLogReport` | Filtra por `RecordDate` > último importado e possui unique key por CPF+Curso+Tipo+Data.【F:EnrichIpedWorker/Services/LogReportService.cs†L26-L177】【F:EnrichIped.DataInfrastructure/Repositories/IpedLogRepository.cs†L45-L116】【F:EnrichIped.DataInfrastructure/Scripts/CREATE TABLE IpedLogReport.sql†L1-L16】 |
+| `IDevelopmentReportService` | `development` | Indicadores de desenvolvimento (pontos, cursos, engajamento) | `IIpedDevelopmentRepository` | `IpedDevelopmentReport` | Possui fallback para inserção em lotes Dapper caso `LOAD DATA` não esteja habilitado.【F:EnrichIpedWorker/Services/DevelopmentReportService.cs†L61-L177】【F:EnrichIped.DataInfrastructure/Repositories/IpedDevelopmentRepository.cs†L45-L235】【F:EnrichIped.DataInfrastructure/Scripts/CREATE TABLE IpedDevelopmentReport.sql†L1-L19】 |
+| `ICompleteReportService` | `complete` | Progresso completo por curso (datas, status, obrigatoriedade) | `IIpedCompleteRepository` | `IpedCompleteReport` | Processa em blocos de 25k registros e limpa duplicados com laços de 1000 linhas; triggers no script marcam `IsCourseCompleted` automaticamente.【F:EnrichIpedWorker/Services/CompleteReportService.cs†L26-L174】【F:EnrichIped.DataInfrastructure/Repositories/IpedCompleteRepository.cs†L33-L242】【F:EnrichIped.DataInfrastructure/Scripts/CREATE TABLE IpedCompleteReport.sql†L1-L42】 |
+
+## Camada de Cliente IPED
+O projeto `EnrichIpedClient` expõe:
+- **`IpedSettings`** – configura URI e tokens; o método `GetAllTokens()` permite cadastrar múltiplos tokens (principal e UDT).【F:EnrichIpedClient/Configurations/IpedSettings.cs†L3-L16】
+- **`AddIpedClient`** – registra um cliente Refit com base address e header `Authorization` preenchido com o token configurado; falha cedo se a URI/token não estiverem definidos.【F:EnrichIpedClient/DependencyInjection.cs†L14-L34】【F:EnrichIpedClient/Constants/IpedClientConstants.cs†L3-L7】
+- **Contrato HTTP** – `IIpedClient.GetReportAsync(token, type)` chama `/api/corporate/get-report` retornando um `ReportResponse` com status, validade e URL do arquivo.【F:EnrichIpedClient/Abstractions/IIpedClient.cs†L7-L11】【F:EnrichIpedClient/Constants/IpedClientEndPoints.cs†L5-L12】【F:EnrichIpedClient/Models/Responses/Reports/ReportResponse.cs†L5-L9】【F:EnrichIpedClient/Models/Responses/Reports/ReportProperties.cs†L5-L13】
+
+## Infraestrutura de Dados
+- **Repositórios** – Implementam `IIpedConfigurationRepository`, `IIpedLogRepository`, `IIpedDevelopmentRepository` e `IIpedCompleteRepository`, todos resolvidos via DI e usando `MySqlConnector`/`Dapper`. Cada repositório controla abertura de conexão, sanitização de dados e descarte de pools ao final da execução.【F:EnrichIped.DataInfrastructure/Repositories/IpedConfigurationRepository.cs†L17-L112】【F:EnrichIped.DataInfrastructure/Repositories/IpedLogRepository.cs†L19-L172】【F:EnrichIped.DataInfrastructure/Repositories/IpedDevelopmentRepository.cs†L20-L291】【F:EnrichIped.DataInfrastructure/Repositories/IpedCompleteRepository.cs†L19-L242】
+- **Scripts SQL** – `SqlScriptLoader` carrega arquivos da pasta `Scripts` tanto do output quanto do diretório atual, garantindo que o schema esteja disponível mesmo fora do publish.【F:EnrichIped.DataInfrastructure/Utilities/LoadSqlScript.cs†L3-L17】
+- **Configurações de lote** – `BatchSettings` (em `appsettings`) controla tamanho máximo de lote e paralelismo das operações em massa; os repositórios leem esses valores via `IConfiguration`.【F:EnrichIped.DataInfrastructure/Configurations/BatchSettings.cs†L3-L9】【F:EnrichIpedWorker/appsettings.json†L10-L15】【F:EnrichIped.DataInfrastructure/Repositories/IpedDevelopmentRepository.cs†L32-L58】
+- **Sanitização** – `StringExtensions` remove caracteres de controle, normaliza números e converte datas inválidas para `1000-01-01`, evitando falhas na conversão para `DateTime`/`int`.【F:EnrichIped.DataInfrastructure/Extensions/StringExtensions.cs†L5-L62】
+
+## Configuração da Aplicação
+O arquivo `appsettings.json` define:
+- `ConnectionStrings:Finance` – string de conexão MySQL (obrigatória).
+- `IpedSettings` – URI e tokens utilizados pelos jobs.
+- `BatchSettings` – controle de paralelismo e tamanho de lote (ver seção anterior).
+- `Serilog` – níveis mínimos e template de saída do console.【F:EnrichIpedWorker/appsettings.json†L2-L43】
+
+Durante o desenvolvimento, é possível habilitar `appsettings.Development.json` ou usar User Secrets (`AddUserSecrets`) para preservar credenciais.【F:EnrichIpedWorker/Program.cs†L15-L19】
+
+## Execução Local
+1. **Pré-requisitos**: .NET SDK 8, MySQL com suporte a `LOAD DATA LOCAL INFILE` e tabelas criadas pelo initializer, credenciais IPED válidas.
+2. **Configuração**:
+   - Atualize `appsettings.Development.json` ou variáveis de ambiente com a connection string e tokens.
+   - Garanta que o usuário MySQL possua permissões de criação de tabela e execução de `LOAD DATA`.
+3. **Build & Run**:
+   ```bash
+   dotnet build EnrichIpedWorker/EnrichIped.BackgroundServices.csproj
+   dotnet run --project EnrichIpedWorker/EnrichIped.BackgroundServices.csproj
+   ```
+   O host iniciará os jobs Hangfire e executará `StartupJobService` após 1 minuto.【F:EnrichIpedWorker/Program.cs†L9-L49】【F:EnrichIpedWorker/Services/StartupJobService.cs†L19-L34】
+4. **Observabilidade**: logs aparecem no console com o template configurado em Serilog; o Hangfire Dashboard pode ser habilitado registrando `DashboardHostedService` (comentado atualmente).【F:EnrichIpedWorker/Configurations/LogConfiguration.cs†L10-L27】【F:EnrichIpedWorker/Services/DashboardHostedService.cs†L1-L56】
+
+## Execução via Docker
+O Dockerfile realiza restore, build e publish multi-stage, esperando que as credenciais de feed NuGet sejam passadas via argumentos de build. O estágio final roda como `dotnet EnrichIped.BackgroundServices.dll` e depende da variável `APP_UID` para definir o usuário do container.【F:Dockerfile†L1-L32】
+
+### Exemplo de build e run
+```bash
+docker build -t enrich-iped-worker \
+  --build-arg ARTIFACTS_ENDPOINT=<nuget-feed> \
+  --build-arg ACCESS_TOKEN=<token> \
+  --build-arg USER=<email> .
+
+docker run --rm \
+  -e ConnectionStrings__Finance="server=..." \
+  -e IpedSettings__Uri="https://..." \
+  -e IpedSettings__Token="..." \
+  enrich-iped-worker
+```
+
+## CI/CD
+O pipeline `azure-pipelines.yml` dispara em `main`, constroi a imagem Docker, faz push para um ECR da AWS e reutiliza um template IaC para atualizar a task definition de um serviço ECS existente (`etl-financeiro`).【F:azure-pipelines.yml†L5-L75】
+
+## Estendendo a Solução
+- **Novo tipo de relatório**: crie uma nova implementação baseada em `BaseReportService`, defina constantes em `IpedConstants`, registre o serviço em `AddHangfireConfiguration` e configure repositório/DTO/queries no projeto `DataInfrastructure`.
+- **Monitoramento Hangfire**: para expor o dashboard, descomente o registro do `DashboardHostedService` e garanta a publicação do endpoint HTTP interno na porta 5000.【F:EnrichIpedWorker/Configurations/HangfireConfiguration.cs†L63-L65】【F:EnrichIpedWorker/Services/DashboardHostedService.cs†L19-L55】
+- **Ajustes de desempenho**: altere `BatchSettings` (tamanho/paralelismo) e `WorkerCount`/`Queues` do Hangfire para adequar o throughput.【F:EnrichIpedWorker/Configurations/HangfireConfiguration.cs†L56-L62】【F:EnrichIpedWorker/appsettings.json†L10-L15】
+
+## Referências Rápidas
+- **Tipos de dados**: ver DTOs em `EnrichIped.DataInfrastructure/Dtos`.
+- **Scripts SQL**: em `EnrichIped.DataInfrastructure/Scripts`.
+- **Constantes**: `EnrichIpedWorker/Constants/IpedConstants.cs` e `EnrichIpedClient/Constants`.
+- **Extensões utilitárias**: `EnrichIped.DataInfrastructure/Extensions/StringExtensions.cs`.
+
+## Rotina de busca de dados da IPED e gatilhos
+
+- Rotina de busca
+  - A chamada à API IPED é feita por `BaseReportService.GetReportAsync(...)` em `EnrichIpedWorker/Services/Base/BaseReportService.cs`, que delega para o cliente Refit `IIpedClient.GetReportAsync(token, type)` definido em `EnrichIpedClient/Abstractions/IIpedClient.cs` e exposto no endpoint "/api/corporate/get-report?token={token}&type={type}" (`EnrichIpedClient/Constants/IpedClientEndPoints.cs`).
+  - Quando o status do relatório está "completed", o arquivo CSV é baixado via `HttpClient.GetByteArrayAsync(response.Content?.Report?.File)` dentro de `BaseReportService.ExecuteAsync(...)`, e cada serviço concreto processa e persiste os dados:
+    - Development: `EnrichIpedWorker/Services/DevelopmentReportService.cs`
+    - Log: `EnrichIpedWorker/Services/LogReportService.cs`
+    - Complete: `EnrichIpedWorker/Services/CompleteReportService.cs`
+
+- Gatilhos de execução
+  - Jobs recorrentes (Hangfire), agendados diariamente às 06:00, configurados em `EnrichIpedWorker/Configurations/HangfireConfiguration.cs` via `RecurringJob.AddOrUpdate<TService>(..., Cron.Daily(6))` para os três serviços (Log, Development, Complete).
+  - Disparo inicial no boot: um job de Development é enfileirado 1 minuto após a inicialização por `StartupJobService` em `EnrichIpedWorker/Services/StartupJobService.cs` usando `BackgroundJob.Enqueue<IDevelopmentReportService>(...)`.
+
+Com esta documentação você tem uma visão completa dos serviços, dos fluxos Hangfire e de como configurar o worker para importar, higienizar e persistir os relatórios IPED em uma base MySQL.
